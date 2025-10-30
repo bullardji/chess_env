@@ -1740,6 +1740,11 @@ void c_step(Chess* env) {
     
     do_move(&env->pos, chosen_move, env->undo_stack, &env->undo_stack_ptr);
     
+    // Sanity check: verify the move didn't leave the agent in check (would be illegal)
+    if (is_check(&env->pos, CHESS_WHITE)) {
+        env->log.illegal_moves += 1.0f;  // BUG DETECTED: illegal move got through!
+    }
+    
     Move opp_move = search_opponent_move(&env->pos, env->opponent_depth, env->undo_stack, &env->undo_stack_ptr);
     
     if (opp_move == MOVE_NONE) {
@@ -1798,6 +1803,11 @@ void c_step(Chess* env) {
     }
     
     do_move(&env->pos, opp_move, env->undo_stack, &env->undo_stack_ptr);
+    
+    // Sanity check: verify opponent's move didn't leave them in check (would be illegal)
+    if (is_check(&env->pos, CHESS_BLACK)) {
+        env->log.illegal_moves += 1.0f;  // BUG DETECTED: opponent made illegal move!
+    }
     
     if (env->undo_stack_ptr > 0 && env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull > 99) {
         env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull = 99;
