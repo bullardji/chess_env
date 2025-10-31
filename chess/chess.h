@@ -177,13 +177,13 @@ typedef struct {
 enum {
     O_BOARD = 0,
     O_SIDE = 768,
-    O_CASTLE = 769,
-    O_EP = 770,
-    O_PICK_PHASE = 771,
-    O_SELECTED_PIECE = 772,
-    O_VALID_PIECES = 836,
-    O_VALID_DESTS = 900,
-    OBS_SIZE = 964
+    O_CASTLE = 770,
+    O_EP = 786,
+    O_PICK_PHASE = 851,
+    O_SELECTED_PIECE = 853,
+    O_VALID_PIECES = 917,
+    O_VALID_DESTS = 981,
+    OBS_SIZE = 1045
 };
 
 typedef struct {
@@ -1608,10 +1608,21 @@ void populate_observations(Chess* env) {
         board_planes[plane * 64 + sq] = 1;
     }
     
-    obs[O_SIDE] = (uint8_t)pos->sideToMove;
-    obs[O_CASTLE] = (uint8_t)pos->castlingRights;
-    obs[O_EP] = (uint8_t)pos->epSquare;
-    obs[O_PICK_PHASE] = (uint8_t)env->pick_phase;
+    uint8_t* side_onehot = obs + O_SIDE;
+    side_onehot[pos->sideToMove] = 1;
+    
+    uint8_t* castle_onehot = obs + O_CASTLE;
+    castle_onehot[pos->castlingRights] = 1;
+    
+    uint8_t* ep_onehot = obs + O_EP;
+    if (pos->epSquare < 64) {
+        ep_onehot[pos->epSquare] = 1;
+    } else {
+        ep_onehot[64] = 1;
+    }
+    
+    uint8_t* phase_onehot = obs + O_PICK_PHASE;
+    phase_onehot[env->pick_phase] = 1;
     
     uint8_t* selected_piece_plane = obs + O_SELECTED_PIECE;
     if (env->pick_phase == 1 && env->selected_square != SQ_NONE) {
@@ -1740,9 +1751,8 @@ void c_step(Chess* env) {
     
     do_move(&env->pos, chosen_move, env->undo_stack, &env->undo_stack_ptr);
     
-    // Sanity check: verify the move didn't leave the agent in check (would be illegal)
     if (is_check(&env->pos, CHESS_WHITE)) {
-        env->log.illegal_moves += 1.0f;  // BUG DETECTED: illegal move got through!
+        env->log.illegal_moves += 1.0f; 
     }
     
     Move opp_move = search_opponent_move(&env->pos, env->opponent_depth, env->undo_stack, &env->undo_stack_ptr);
@@ -1804,9 +1814,8 @@ void c_step(Chess* env) {
     
     do_move(&env->pos, opp_move, env->undo_stack, &env->undo_stack_ptr);
     
-    // Sanity check: verify opponent's move didn't leave them in check (would be illegal)
     if (is_check(&env->pos, CHESS_BLACK)) {
-        env->log.illegal_moves += 1.0f;  // BUG DETECTED: opponent made illegal move!
+        env->log.illegal_moves += 1.0f; 
     }
     
     if (env->undo_stack_ptr > 0 && env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull > 99) {
@@ -1987,5 +1996,4 @@ void c_close(Chess* env) {
     (void)env;  // Unused when rendering disabled
 #endif
 }
-
 
