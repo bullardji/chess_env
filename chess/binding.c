@@ -115,8 +115,6 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "timeouts", log->timeouts);
     assign_to_dict(dict, "invalid_action_rate", log->invalid_action_rate);
     assign_to_dict(dict, "chess_moves_completed", log->chess_moves_completed);
-    float total = log->wins + log->losses + log->draws + log->timeouts;
-    assign_to_dict(dict, "winrate", total > 0.0f ? log->wins / total : 0.0f);
     assign_to_dict(dict, "illegal_moves", log->illegal_moves);
     assign_to_dict(dict, "avg_legal_moves", log->avg_legal_moves);
     return 0;
