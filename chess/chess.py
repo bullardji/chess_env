@@ -6,9 +6,9 @@ from pufferlib.ocean.chess import binding
 
 class Chess(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0,
-                 max_moves=3000, opponent_depth=-1, reward_shaping_weight=0.0,
+                 max_moves=3000, opponent_depth=-1, reward_shaping_weight=0.05,
                  reward_draw=-0.5, reward_invalid_piece=-0.1, reward_invalid_move=-0.1, 
-                 reward_valid_piece=0.01, reward_valid_move=0.05, render_fps=30, human_play=0,
+                 reward_valid_piece=0.0, reward_valid_move=0.0, render_fps=30, human_play=0,
                  starting_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"):
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=255, shape=(1045,), dtype=np.uint8)
