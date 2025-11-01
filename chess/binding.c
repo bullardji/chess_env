@@ -18,12 +18,12 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     
     env->max_moves = 3000;
     env->opponent_depth = -1;
-    env->reward_shaping_weight = 0.0f;
+    env->reward_shaping_weight = 0.05f;
     env->reward_draw = -0.5f;
     env->reward_invalid_piece = -0.1f;
     env->reward_invalid_move = -0.1f;
-    env->reward_valid_piece = 0.01f;
-    env->reward_valid_move = 0.05f;
+    env->reward_valid_piece = 0.0f;
+    env->reward_valid_move = 0.0f;
     env->client = NULL;
     env->render_fps = 30;
     env->human_play = 0;
