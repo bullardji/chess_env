@@ -162,6 +162,8 @@ typedef struct {
     Key key;
     int16_t materialScore;
     int16_t psqtScore;
+    int16_t cachedEval;
+    uint8_t evalValid;
 } Position;
 
 typedef struct {
@@ -174,11 +176,12 @@ typedef struct {
     Key key;
     Move best_move;
     Value value;
+    int16_t static_eval;
     int8_t depth;
     uint8_t flag;  // 0=exact, 1=lower bound, 2=upper bound
 } TTEntry;
 
-#define TT_SIZE 1048576  // 1M entries (~16MB)
+#define TT_SIZE 1048576
 #define TT_EXACT 0
 #define TT_LOWER 1
 #define TT_UPPER 2
@@ -248,12 +251,17 @@ typedef struct {
     
     Position pos;
     MoveList legal_moves;
+    ChessColor legal_moves_side;  // Track which side legal_moves was generated for
     int game_result;
     int tick;
     int chess_moves;
     int max_moves;
     int opponent_depth;
     float reward_shaping_weight;
+    float reward_shaping_weight_initial;
+    float reward_shaping_weight_final;
+    float reward_shaping_anneal_steps;
+    uint64_t env_training_steps;
     float reward_draw;
     int render_fps;
     int human_play;
@@ -276,7 +284,6 @@ typedef struct {
     float reward_valid_piece;
     float reward_valid_move;
     
-    // Scoreboard tracking
     float ai_score;
     float opponent_score;
     char last_result[32];
@@ -401,6 +408,7 @@ bool is_check(Position* pos, ChessColor c);
 bool is_draw_with_history(Position* pos, UndoInfo* undo_stack, int undo_stack_ptr);
 
 Value evaluate(Position* pos);
+static Value quiesce(Position* pos, Value alpha, Value beta, UndoInfo* undo_stack, int* undo_stack_ptr);
 
 uint64_t perft(Position* pos, int depth);
 
@@ -422,10 +430,8 @@ Zobrist zob;
 
 static bool bitboards_initialized = false;
 
-// Killer moves (2 per ply, max 64 plies)
 static Move killer_moves[64][2];
 
-// TT helper functions
 static inline void tt_clear(void) {
     memset(transposition_table, 0, sizeof(transposition_table));
     memset(killer_moves, 0, sizeof(killer_moves));
@@ -436,14 +442,15 @@ static inline TTEntry* tt_probe(Key key) {
     return &transposition_table[key % TT_SIZE];
 }
 
-static inline void tt_store(Key key, Move move, Value value, int depth, uint8_t flag) {
+static inline void tt_store(Key key, Move move, Value value, int depth, uint8_t flag, Value static_eval) {
     TTEntry* entry = tt_probe(key);
-    if (entry->depth <= depth) {  // Replace if deeper or equal depth
+    if (entry->depth <= depth) {
         entry->key = key;
         entry->best_move = move;
         entry->value = value;
         entry->depth = depth;
         entry->flag = flag;
+        entry->static_eval = static_eval;
     }
 }
 
@@ -454,70 +461,141 @@ static inline void store_killer(Move move, int ply) {
     }
 }
 
-static const int PawnPST[64] = {
-      0,   0,   0,   0,   0,   0,   0,   0,
-     50,  50,  50,  50,  50,  50,  50,  50,
-     10,  10,  20,  30,  30,  20,  10,  10,
-      5,   5,  10,  25,  25,  10,   5,   5,
-      0,   0,   0,  20,  20,   0,   0,   0,
-      5,  -5, -10,   0,   0, -10,  -5,   5,
-      5,  10,  10, -20, -20,  10,  10,   5,
-      0,   0,   0,   0,   0,   0,   0,   0
+// Piece-Square Tables (numbers calculated from Stockfish)
+static inline int mirror_file(int file) {
+    return file < 4 ? file : (7 - file);
+}
+
+static const int PawnPST_MG[64] = {
+    0,   0,   0,   0,   0,   0,   0,   0,
+    -11,  7,  7, 17, 17,  7,  7, -11,
+    -16, -3, 23, 23, 23, 23, -3, -16,
+    -14, -7, 20, 24, 24, 20, -7, -14,
+    -5, -2, -1, 12, 12, -1, -2,  -5,
+    -11,-12, -2,  4,  4, -2,-12, -11,
+    -2, 20,-10, -2, -2,-10, 20,  -2,
+    0,   0,   0,   0,   0,   0,   0,   0
 };
 
-static const int KnightPST[64] = {
-    -50, -40, -30, -30, -30, -30, -40, -50,
-    -40, -20,   0,   0,   0,   0, -20, -40,
-    -30,   0,  10,  15,  15,  10,   0, -30,
-    -30,   5,  15,  20,  20,  15,   5, -30,
-    -30,   0,  15,  20,  20,  15,   0, -30,
-    -30,   5,  10,  15,  15,  10,   5, -30,
-    -40, -20,   0,   5,   5,   0, -20, -40,
-    -50, -40, -30, -30, -30, -30, -40, -50
+static const int PawnPST_EG[64] = {
+    0,  0,  0,  0,  0,  0,  0,  0,
+    -3, -1,  7,  2,  2,  7, -1, -3,
+    -2,  2,  6, -1, -1,  6,  2, -2,
+    7, -4, -8,  2,  2, -8, -4,  7,
+    13, 10, -1, -8, -8, -1, 10, 13,
+    16,  6,  1, 16, 16,  1,  6, 16,
+    1,-12,  6, 25, 25,  6,-12,  1,
+    0,  0,  0,  0,  0,  0,  0,  0
 };
 
-static const int BishopPST[64] = {
-    -20, -10, -10, -10, -10, -10, -10, -20,
-    -10,   0,   0,   0,   0,   0,   0, -10,
-    -10,   0,   5,  10,  10,   5,   0, -10,
-    -10,   5,   5,  10,  10,   5,   5, -10,
-    -10,   0,  10,  10,  10,  10,   0, -10,
-    -10,  10,  10,  10,  10,  10,  10, -10,
-    -10,   5,   0,   0,   0,   0,   5, -10,
-    -20, -10, -10, -10, -10, -10, -10, -20
+static const int KnightPST_MG[64] = {
+    -169,-96,-80,-79,-79,-80,-96,-169,
+    -79,-39,-24, -9, -9,-24,-39, -79,
+    -64,-20,  4, 19, 19,  4,-20, -64,
+    -28,  5, 41, 47, 47, 41,  5, -28,
+    -29, 13, 42, 52, 52, 42, 13, -29,
+    -11, 28, 63, 55, 55, 63, 28, -11,
+    -67,-21,  6, 37, 37,  6,-21, -67,
+    -200,-80,-53,-32,-32,-53,-80,-200
 };
 
-static const int RookPST[64] = {
-      0,   0,   0,   0,   0,   0,   0,   0,
-      5,  10,  10,  10,  10,  10,  10,   5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-     -5,   0,   0,   0,   0,   0,   0,  -5,
-      0,   0,   0,   5,   5,   0,   0,   0
+static const int KnightPST_EG[64] = {
+    -105,-74,-46,-18,-18,-46,-74,-105,
+    -70,-56,-15,  6,  6,-15,-56, -70,
+    -38,-33, -5, 27, 27, -5,-33, -38,
+    -36,  0, 13, 34, 34, 13,  0, -36,
+    -41,-20,  4, 35, 35,  4,-20, -41,
+    -51,-38,-17, 19, 19,-17,-38, -51,
+    -64,-45,-37, 16, 16,-37,-45, -64,
+    -98,-89,-53,-16,-16,-53,-89, -98
 };
 
-static const int QueenPST[64] = {
-    -20, -10, -10,  -5,  -5, -10, -10, -20,
-    -10,   0,   0,   0,   0,   0,   0, -10,
-    -10,   0,   5,   5,   5,   5,   0, -10,
-     -5,   0,   5,   5,   5,   5,   0,  -5,
-      0,   0,   5,   5,   5,   5,   0,  -5,
-    -10,   5,   5,   5,   5,   5,   0, -10,
-    -10,   0,   5,   0,   0,   0,   0, -10,
-    -20, -10, -10,  -5,  -5, -10, -10, -20
+static const int BishopPST_MG[64] = {
+    -49, -7,-10,-34,-34,-10, -7,-49,
+    -24,  9, 15,  1,  1, 15,  9,-24,
+    -9, 22, -3, 12, 12, -3, 22, -9,
+    4,  9, 18, 40, 40, 18,  9,  4,
+    -8, 27, 13, 30, 30, 13, 27, -8,
+    -17, 14, -6,  6,  6, -6, 14,-17,
+    -19,-13,  7,-11,-11,  7,-13,-19,
+    -47, -7,-17,-29,-29,-17, -7,-47
 };
 
-static const int KingPST[64] = {
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -20, -30, -30, -40, -40, -30, -30, -20,
-    -10, -20, -20, -20, -20, -20, -20, -10,
-     20,  20,   0,   0,   0,   0,  20,  20,
-     20,  30,  10,   0,   0,  10,  30,  20
+static const int BishopPST_EG[64] = {
+    -58,-31,-37,-19,-19,-37,-31,-58,
+    -34, -9,-14,  4,  4,-14, -9,-34,
+    -23,  0, -3, 16, 16, -3,  0,-23,
+    -26, -3, -5, 16, 16, -5, -3,-26,
+    -26, -4, -7, 14, 14, -7, -4,-26,
+    -24, -2,  0, 13, 13,  0, -2,-24,
+    -34,-10,-12,  6,  6,-12,-10,-34,
+    -55,-32,-36,-17,-17,-36,-32,-55
+};
+
+static const int RookPST_MG[64] = {
+    -24,-15, -8,  0,  0, -8,-15,-24,
+    -18, -5, -1,  1,  1, -1, -5,-18,
+    -19,-10,  1,  0,  0,  1,-10,-19,
+    -21, -7, -4, -4, -4, -4, -7,-21,
+    -21,-12, -1,  4,  4, -1,-12,-21,
+    -23,-10,  1,  6,  6,  1,-10,-23,
+    -11,  8,  9, 12, 12,  9,  8,-11,
+    -25,-18,-11,  2,  2,-11,-18,-25
+};
+
+static const int RookPST_EG[64] = {
+    0,  3,  0,  3,  3,  0,  3,  0,
+    -7, -5, -5, -1, -1, -5, -5, -7,
+    6, -7,  3,  3,  3,  3, -7,  6,
+    0,  4, -2,  1,  1, -2,  4,  0,
+    -7,  5, -5, -7, -7, -5,  5, -7,
+    3,  2, -1,  3,  3, -1,  2,  3,
+    -1,  7, 11, -1, -1, 11,  7, -1,
+    6,  4,  6,  2,  2,  6,  4,  6
+};
+
+static const int QueenPST_MG[64] = {
+    3, -5, -5,  4,  4, -5, -5,  3,
+    -3,  5,  8, 12, 12,  8,  5, -3,
+    -3,  6, 13,  7,  7, 13,  6, -3,
+    4,  5,  9,  8,  8,  9,  5,  4,
+    0, 14, 12,  5,  5, 12, 14,  0,
+    -4, 10,  6,  8,  8,  6, 10, -4,
+    -5,  6, 10,  8,  8, 10,  6, -5,
+    -2, -2,  1, -2, -2,  1, -2, -2
+};
+
+static const int QueenPST_EG[64] = {
+    -69,-57,-47,-26,-26,-47,-57,-69,
+    -55,-31,-22, -4, -4,-22,-31,-55,
+    -39,-18, -9,  3,  3, -9,-18,-39,
+    -23, -3, 13, 24, 24, 13, -3,-23,
+    -29, -6,  9, 21, 21,  9, -6,-29,
+    -38,-18,-12,  1,  1,-12,-18,-38,
+    -50,-27,-24, -8, -8,-24,-27,-50,
+    -75,-52,-43,-36,-36,-43,-52,-75
+};
+
+static const int KingPST_MG[64] = {
+    272,325,273,190,190,273,325,272,
+    277,305,241,183,183,241,305,277,
+    198,253,168,120,120,168,253,198,
+    169,191,136,108,108,136,191,169,
+    145,176,112, 69, 69,112,176,145,
+    122,159, 85, 36, 36, 85,159,122,
+    87,120, 64, 25, 25, 64,120, 87,
+    64, 87, 49,  0,  0, 49, 87, 64
+};
+
+static const int KingPST_EG[64] = {
+    0, 41, 80, 93, 93, 80, 41,  0,
+    57, 98,138,131,131,138, 98, 57,
+    86,138,165,173,173,165,138, 86,
+    103,152,168,169,169,168,152,103,
+    98,166,197,194,194,197,166, 98,
+    87,164,174,189,189,174,164, 87,
+    40, 99,128,141,141,128, 99, 40,
+    5, 60, 75, 75, 75, 75, 60,  5
 };
 
 
@@ -727,12 +805,12 @@ void pos_set(Position* pos, const char* fen) {
         Square s = (c == CHESS_WHITE) ? sq : (sq ^ 56);
         int pst_val = 0;
         switch (pt) {
-            case PAWN: pst_val = PawnPST[s]; break;
-            case KNIGHT: pst_val = KnightPST[s]; break;
-            case BISHOP: pst_val = BishopPST[s]; break;
-            case ROOK: pst_val = RookPST[s]; break;
-            case QUEEN: pst_val = QueenPST[s]; break;
-            case KING: pst_val = KingPST[s]; break;
+            case PAWN: pst_val = PawnPST_MG[s]; break;
+            case KNIGHT: pst_val = KnightPST_MG[s]; break;
+            case BISHOP: pst_val = BishopPST_MG[s]; break;
+            case ROOK: pst_val = RookPST_MG[s]; break;
+            case QUEEN: pst_val = QueenPST_MG[s]; break;
+            case KING: pst_val = KingPST_MG[s]; break;
         }
         pos->psqtScore += sign * pst_val;
     }
@@ -954,15 +1032,17 @@ bool is_check(Position* pos, ChessColor c) {
     return (attackers_to_sq(pos, king_sq, pieces(pos)) & pieces_c(pos, !c)) != 0;
 }
 
-// Working baseline evaluation - material + PST only
 static Value evaluate_simple(Position* pos) {
     return pos->materialScore + pos->psqtScore;
 }
 
-// Enhanced evaluation with careful scaling (based on Stockfish 10)
 static Value evaluate_enhanced(Position* pos) {
-    // Start with material (most important)
     Value score = pos->materialScore + pos->psqtScore;
+    
+    // Lazy eval
+    if (score > 400 || score < -400) {
+        return score;
+    }
     
     ChessColor us = pos->sideToMove;
     ChessColor them = !us;
@@ -975,7 +1055,6 @@ static Value evaluate_enhanced(Position* pos) {
     
     int mg_bonus = 0, eg_bonus = 0;
     
-    // Mobility bonuses (from CFish/Stockfish 10)
     static const int knight_mobility_mg[9] = {-62, -53, -12, -4, 3, 13, 22, 28, 33};
     static const int knight_mobility_eg[9] = {-81, -56, -30, -14, 8, 15, 23, 27, 33};
     static const int bishop_mobility_mg[14] = {-48, -20, 16, 26, 38, 51, 55, 63, 63, 68, 81, 81, 91, 98};
@@ -985,7 +1064,7 @@ static Value evaluate_enhanced(Position* pos) {
     static const int queen_mobility_mg[28] = {-39, -21, 3, 3, 14, 22, 28, 41, 43, 48, 56, 60, 60, 66, 67, 70, 71, 73, 79, 88, 88, 99, 102, 102, 106, 109, 113, 116};
     static const int queen_mobility_eg[28] = {-36, -15, 8, 18, 34, 54, 61, 73, 79, 92, 94, 104, 113, 120, 123, 126, 133, 136, 140, 143, 148, 166, 170, 175, 184, 191, 206, 212};
     
-    // Mobility area: squares not attacked by enemy pawns, not occupied by our pawns/king
+    // Mobility calc
     Bitboard our_pawns = pieces_cp(pos, us, PAWN);
     Bitboard their_pawns = pieces_cp(pos, them, PAWN);
     Bitboard our_pawn_attacks = all_pawn_attacks(our_pawns, us);
@@ -993,14 +1072,13 @@ static Value evaluate_enhanced(Position* pos) {
     Bitboard our_mobility_area = ~(their_pawn_attacks | our_pawns | pieces_cp(pos, us, KING));
     Bitboard their_mobility_area = ~(our_pawn_attacks | their_pawns | pieces_cp(pos, them, KING));
     
-    // Knight mobility and outposts
     Bitboard knights = pieces_cp(pos, us, KNIGHT);
     while (knights) {
         Square sq = pop_lsb(&knights);
         int mob = popcount(knight_attacks_bb(sq) & our_mobility_area);
         if (mob < 9) { mg_bonus += knight_mobility_mg[mob]; eg_bonus += knight_mobility_eg[mob]; }
         
-        // Outpost: knight on strong square (ranks 4-6, not attacked by enemy pawns)
+        // Knight outpost
         int rank = (us == CHESS_WHITE) ? rank_of(sq) : (7 - rank_of(sq));
         if (rank >= 3 && rank <= 5 && !(their_pawn_attacks & sq_bb(sq))) {
             bool supported = (our_pawn_attacks & sq_bb(sq)) != 0;
@@ -1028,8 +1106,6 @@ static Value evaluate_enhanced(Position* pos) {
         Square sq = pop_lsb(&bishops);
         int mob = popcount(bishop_attacks_bb(sq, occupied) & our_mobility_area);
         if (mob < 14) { mg_bonus += bishop_mobility_mg[mob]; eg_bonus += bishop_mobility_eg[mob]; }
-        
-        // Bishop outpost
         int rank = (us == CHESS_WHITE) ? rank_of(sq) : (7 - rank_of(sq));
         if (rank >= 3 && rank <= 5 && !(their_pawn_attacks & sq_bb(sq))) {
             bool supported = (our_pawn_attacks & sq_bb(sq)) != 0;
@@ -1114,75 +1190,60 @@ static Value evaluate_enhanced(Position* pos) {
         if (mob < 28) { mg_bonus -= queen_mobility_mg[mob]; eg_bonus -= queen_mobility_eg[mob]; }
     }
     
-    // King safety with attack weights
-    static const int king_attack_weights[8] = {0, 0, 77, 55, 44, 10};
-    Bitboard our_king = pieces_cp(pos, us, KING);
-    if (our_king) {
-        Square ksq = lsb(our_king);
-        Bitboard king_ring = king_attacks_bb(ksq);
-        int attack_weight = 0, attack_count = 0;
+    // King safety
+    Bitboard our_king_bb = pieces_cp(pos, us, KING);
+    if (our_king_bb && phase > 12) {
+        Square ksq = lsb(our_king_bb);
+        Bitboard king_zone = king_attacks_bb(ksq);
         
-        Bitboard att = pieces_cp(pos, them, KNIGHT);
-        while (att) { if (knight_attacks_bb(pop_lsb(&att)) & king_ring) { attack_weight += 77; attack_count++; }}
-        att = pieces_cp(pos, them, BISHOP);
-        while (att) { if (bishop_attacks_bb(pop_lsb(&att), occupied) & king_ring) { attack_weight += 55; attack_count++; }}
-        att = pieces_cp(pos, them, ROOK);
-        while (att) { if (rook_attacks_bb(pop_lsb(&att), occupied) & king_ring) { attack_weight += 44; attack_count++; }}
-        att = pieces_cp(pos, them, QUEEN);
-        while (att) { if (queen_attacks_bb(pop_lsb(&att), occupied) & king_ring) { attack_weight += 10; attack_count++; }}
+        int attackers = popcount((pieces_cp(pos, them, KNIGHT) | pieces_cp(pos, them, BISHOP) | 
+                                   pieces_cp(pos, them, ROOK) | pieces_cp(pos, them, QUEEN)) & king_zone);
         
-        if (attack_count >= 2) mg_bonus -= attack_weight * attack_count / 2;
-        
-        // King pawn shield (pawns directly in front of king)
-        int king_file = file_of(ksq);
-        int shield_pawns = 0;
-        for (int f = (king_file > 0 ? king_file - 1 : 0); f <= (king_file < 7 ? king_file + 1 : 7); f++) {
-            if (our_pawns & FileBB[f]) shield_pawns++;
+        if (attackers > 0) {
+            mg_bonus -= attackers * 30;
         }
-        mg_bonus += shield_pawns * 15;
-    }
-    
-    Bitboard their_king = pieces_cp(pos, them, KING);
-    if (their_king) {
-        Square ksq = lsb(their_king);
-        Bitboard king_ring = king_attacks_bb(ksq);
-        int attack_weight = 0, attack_count = 0;
-        
-        Bitboard att = pieces_cp(pos, us, KNIGHT);
-        while (att) { if (knight_attacks_bb(pop_lsb(&att)) & king_ring) { attack_weight += 77; attack_count++; }}
-        att = pieces_cp(pos, us, BISHOP);
-        while (att) { if (bishop_attacks_bb(pop_lsb(&att), occupied) & king_ring) { attack_weight += 55; attack_count++; }}
-        att = pieces_cp(pos, us, ROOK);
-        while (att) { if (rook_attacks_bb(pop_lsb(&att), occupied) & king_ring) { attack_weight += 44; attack_count++; }}
-        att = pieces_cp(pos, us, QUEEN);
-        while (att) { if (queen_attacks_bb(pop_lsb(&att), occupied) & king_ring) { attack_weight += 10; attack_count++; }}
-        
-        if (attack_count >= 2) mg_bonus += attack_weight * attack_count / 2;
         
         int king_file = file_of(ksq);
-        int shield_pawns = 0;
+        int shield = 0;
         for (int f = (king_file > 0 ? king_file - 1 : 0); f <= (king_file < 7 ? king_file + 1 : 7); f++) {
-            if (their_pawns & FileBB[f]) shield_pawns++;
+            if (our_pawns & FileBB[f]) shield++;
         }
-        mg_bonus -= shield_pawns * 15;
+        mg_bonus += shield * 10;
     }
     
-    // Advanced pawn structure evaluation
+    Bitboard their_king_bb = pieces_cp(pos, them, KING);
+    if (their_king_bb && phase > 12) {
+        Square ksq = lsb(their_king_bb);
+        Bitboard king_zone = king_attacks_bb(ksq);
+        
+        int attackers = popcount((pieces_cp(pos, us, KNIGHT) | pieces_cp(pos, us, BISHOP) | 
+                                   pieces_cp(pos, us, ROOK) | pieces_cp(pos, us, QUEEN)) & king_zone);
+        
+        if (attackers > 0) {
+            mg_bonus += attackers * 30;
+        }
+        
+        int king_file = file_of(ksq);
+        int shield = 0;
+        for (int f = (king_file > 0 ? king_file - 1 : 0); f <= (king_file < 7 ? king_file + 1 : 7); f++) {
+            if (their_pawns & FileBB[f]) shield++;
+        }
+        mg_bonus -= shield * 10;
+    }
+    
+    // Pawn structure
     for (int file = 0; file < 8; file++) {
         Bitboard our_pawns_on_file = our_pawns & FileBB[file];
         Bitboard their_pawns_on_file = their_pawns & FileBB[file];
         int our_count = popcount(our_pawns_on_file);
         int their_count = popcount(their_pawns_on_file);
         
-        // Doubled pawns
         if (our_count > 1) { mg_bonus -= (our_count - 1) * 11; eg_bonus -= (our_count - 1) * 13; }
         if (their_count > 1) { mg_bonus += (their_count - 1) * 11; eg_bonus += (their_count - 1) * 13; }
-        
-        // Isolated pawns (no friendly pawns on adjacent files)
         bool our_left = (file > 0) && (our_pawns & FileBB[file - 1]);
         bool our_right = (file < 7) && (our_pawns & FileBB[file + 1]);
         if (our_count > 0 && !our_left && !our_right) {
-            mg_bonus -= 11; eg_bonus -= 20; // Isolated pawn penalty
+            mg_bonus -= 11; eg_bonus -= 20;
         }
         
         bool their_left = (file > 0) && (their_pawns & FileBB[file - 1]);
@@ -1203,7 +1264,6 @@ static Value evaluate_enhanced(Position* pos) {
         int file = file_of(sq);
         int our_rank = (us == CHESS_WHITE) ? rank : (7 - rank);
         
-        // Check if passed
         Bitboard front_span = 0;
         if (us == CHESS_WHITE) {
             for (int r = rank + 1; r <= 7; r++) {
@@ -1225,13 +1285,12 @@ static Value evaluate_enhanced(Position* pos) {
             eg_bonus += passed_pawn_eg[our_rank];
         }
         
-        // Pawn phalanx (side-by-side pawns) - stronger than diagonal support
-        if ((sq_bb(sq) << 1) & our_pawns) { // Pawn to the left
+        if ((sq_bb(sq) << 1) & our_pawns) {
             mg_bonus += 8 + our_rank * 2;
             eg_bonus += 5 + our_rank;
         }
         
-        // Backward pawns: can't advance safely and no friendly pawns behind on adjacent files
+        // Backward pawns
         bool can_advance_safely = true;
         Square advance_sq = (us == CHESS_WHITE) ? sq + 8 : sq - 8;
         if (advance_sq >= 0 && advance_sq < 64) {
@@ -1245,11 +1304,10 @@ static Value evaluate_enhanced(Position* pos) {
         }
         
         if (!can_advance_safely && !has_support_behind && !is_passed) {
-            mg_bonus -= 9; eg_bonus -= 24; // Backward pawn
+            mg_bonus -= 9; eg_bonus -= 24;
         }
     }
     
-    // Opponent pawns
     Bitboard their_pawn_scan = their_pawns;
     while (their_pawn_scan) {
         Square sq = pop_lsb(&their_pawn_scan);
@@ -1308,7 +1366,7 @@ static Value evaluate_enhanced(Position* pos) {
         mg_bonus -= 30; eg_bonus -= 65;
     }
     
-    // Threats: pieces attacking higher value enemy pieces
+    // Threats
     Bitboard our_knights = pieces_cp(pos, us, KNIGHT);
     Bitboard our_bishops = pieces_cp(pos, us, BISHOP);
     Bitboard their_queens = pieces_cp(pos, them, QUEEN);
@@ -1316,7 +1374,6 @@ static Value evaluate_enhanced(Position* pos) {
     Bitboard their_bishops = pieces_cp(pos, them, BISHOP);
     Bitboard their_knights = pieces_cp(pos, them, KNIGHT);
     
-    // Our minor pieces threatening their pieces
     Bitboard our_minor_attacks = 0;
     Bitboard kn = our_knights;
     while (kn) our_minor_attacks |= knight_attacks_bb(pop_lsb(&kn));
@@ -1328,7 +1385,6 @@ static Value evaluate_enhanced(Position* pos) {
     if (our_minor_attacks & their_bishops) { mg_bonus += 57; eg_bonus += 44; }
     if (our_minor_attacks & their_knights) { mg_bonus += 39; eg_bonus += 42; }
     
-    // Their minor pieces threatening our pieces
     Bitboard their_minor_attacks = 0;
     kn = their_knights;
     while (kn) their_minor_attacks |= knight_attacks_bb(pop_lsb(&kn));
@@ -1343,7 +1399,6 @@ static Value evaluate_enhanced(Position* pos) {
     if (their_minor_attacks & our_bishops) { mg_bonus -= 57; eg_bonus -= 44; }
     if (their_minor_attacks & our_knights) { mg_bonus -= 39; eg_bonus -= 42; }
     
-    // Rooks threatening pieces
     Bitboard our_rook_attacks = 0;
     Bitboard rk = pieces_cp(pos, us, ROOK);
     while (rk) our_rook_attacks |= rook_attacks_bb(pop_lsb(&rk), occupied);
@@ -1360,14 +1415,13 @@ static Value evaluate_enhanced(Position* pos) {
     if (their_rook_attacks & our_bishops) { mg_bonus -= 38; eg_bonus -= 71; }
     if (their_rook_attacks & our_knights) { mg_bonus -= 38; eg_bonus -= 61; }
     
-    // Hanging pieces (undefended pieces)
     Bitboard our_attacks = our_pawn_attacks | our_minor_attacks | our_rook_attacks;
     Bitboard their_pieces = pieces_c(pos, them);
     Bitboard their_defended = their_pawn_attacks;
     
     Bitboard hanging = their_pieces & our_attacks & ~their_defended;
     if (hanging) {
-        mg_bonus += popcount(hanging) * 31; // Simplified hanging bonus
+        mg_bonus += popcount(hanging) * 31;
         eg_bonus += popcount(hanging) * 17;
     }
     
@@ -1381,16 +1435,102 @@ static Value evaluate_enhanced(Position* pos) {
         eg_bonus -= popcount(hanging) * 17;
     }
     
-    // Tempo bonus (small advantage for side to move)
+    //Space eval
+    Bitboard center_files = FileCBB | FileDBB | FileEBB | FileFBB;
+    Bitboard space_mask_us = (us == CHESS_WHITE) 
+        ? center_files & (RankBB[RANK_2] | RankBB[RANK_3] | RankBB[RANK_4])
+        : center_files & (RankBB[RANK_7] | RankBB[RANK_6] | RankBB[RANK_5]);
+    
+    Bitboard safe_squares_us = space_mask_us & ~our_pawns & ~their_pawn_attacks;
+    int space_count_us = popcount(safe_squares_us);
+    int our_piece_count = popcount(pieces_c(pos, us)) - popcount(our_pawns);
+    
+    if (our_piece_count > 2 && space_count_us > 0) {
+        int space_bonus = space_count_us * our_piece_count * our_piece_count / 16;
+        mg_bonus += space_bonus;
+    }
+    
+    Bitboard space_mask_them = (them == CHESS_WHITE) 
+        ? center_files & (RankBB[RANK_2] | RankBB[RANK_3] | RankBB[RANK_4])
+        : center_files & (RankBB[RANK_7] | RankBB[RANK_6] | RankBB[RANK_5]);
+    
+    Bitboard safe_squares_them = space_mask_them & ~their_pawns & ~our_pawn_attacks;
+    int space_count_them = popcount(safe_squares_them);
+    int their_piece_count = popcount(pieces_c(pos, them)) - popcount(their_pawns);
+    
+    if (their_piece_count > 2 && space_count_them > 0) {
+        int space_bonus = space_count_them * their_piece_count * their_piece_count / 16;
+        mg_bonus -= space_bonus;
+    }
+    
+    // Initiative
+    int outflanking = 0;
+    Bitboard king_us = pieces_cp(pos, us, KING);
+    Bitboard king_them = pieces_cp(pos, them, KING);
+    
+    if (king_us && king_them) {
+        Square our_ksq = lsb(king_us);
+        Square their_ksq = lsb(king_them);
+        int file_dist = abs(file_of(our_ksq) - file_of(their_ksq));
+        int rank_dist = abs(rank_of(our_ksq) - rank_of(their_ksq));
+        outflanking = file_dist - rank_dist;
+    }
+    
+    Bitboard all_pawns = our_pawns | their_pawns;
+    Bitboard queen_side = FileABB | FileBBB | FileCBB | FileDBB;
+    Bitboard king_side = FileEBB | FileFBB | FileGBB | FileHBB;
+    int pawns_both_flanks = ((all_pawns & queen_side) && (all_pawns & king_side)) ? 1 : 0;
+    
+    int pawn_count = popcount(all_pawns);
+    int pawn_asymmetry = abs(popcount(our_pawns) - popcount(their_pawns));
+    int non_pawn_material = popcount(pieces_c(pos, us) & ~our_pawns) + popcount(pieces_c(pos, them) & ~their_pawns);
+    
+    // Complexity formula (ported from old Stockfish)
+    int complexity = 8 * pawn_asymmetry 
+                   + 12 * pawn_count 
+                   + 12 * outflanking 
+                   + 16 * pawns_both_flanks 
+                   + 48 * (non_pawn_material == 0 ? 1 : 0)
+                   - 118;
+    
+    int eg_estimate = eg_bonus;
+    if (eg_estimate > 0) {
+        int initiative_bonus = (complexity > -abs(eg_estimate)) ? complexity : -abs(eg_estimate);
+        initiative_bonus = (initiative_bonus < abs(eg_estimate)) ? initiative_bonus : abs(eg_estimate);
+        eg_bonus += (initiative_bonus > 0) ? initiative_bonus : 0;
+    } else if (eg_estimate < 0) {
+        int initiative_penalty = (complexity > -abs(eg_estimate)) ? complexity : -abs(eg_estimate);
+        initiative_penalty = (initiative_penalty < abs(eg_estimate)) ? initiative_penalty : abs(eg_estimate);
+        eg_bonus += (initiative_penalty < 0) ? initiative_penalty : 0;
+    }
+    
+    // Pawnless flank penalty
+    if (king_us) {
+        Square ksq = lsb(king_us);
+        Bitboard king_flank = (file_of(ksq) < FILE_E) ? queen_side : king_side;
+        if (!(all_pawns & king_flank)) {
+            mg_bonus -= 18; 
+            eg_bonus -= 94;
+        }
+    }
+    if (king_them) {
+        Square ksq = lsb(king_them);
+        Bitboard king_flank = (file_of(ksq) < FILE_E) ? queen_side : king_side;
+        if (!(all_pawns & king_flank)) {
+            mg_bonus += 18;
+            eg_bonus += 94;
+        }
+    }
+    
+    // Tempo bonus
     mg_bonus += 28; eg_bonus += 28;
     
-    // Tapered eval: interpolate between MG and EG based on phase
     score += (mg_bonus * phase + eg_bonus * (24 - phase)) / 24;
     
     return score;
 }
 
-// MVV-LVA (Most Valuable Victim - Least Valuable Attacker) move ordering
+// MVV-LVA ordering 
 static int mvv_lva_score(Move m, Position* pos) {
     static const int victim_value[7] = {0, 100, 320, 330, 500, 900, 0};
     static const int attacker_value[7] = {0, 1, 3, 3, 5, 9, 10};
@@ -1400,17 +1540,14 @@ static int mvv_lva_score(Move m, Position* pos) {
     
     int score = 0;
     
-    // Captures: Victim value * 10 - Attacker value
     if (captured != NO_PIECE) {
         score = victim_value[type_of_p(captured)] * 10 - attacker_value[type_of_p(attacker)];
     }
     
-    // Promotions are valuable
     if (type_of_m(m) == PROMOTION) {
         score += victim_value[promotion_type(m)];
     }
     
-    // Castling is generally good
     if (type_of_m(m) == CASTLING) {
         score += 50;
     }
@@ -1418,30 +1555,58 @@ static int mvv_lva_score(Move m, Position* pos) {
     return score;
 }
 
-// Optimized alpha-beta search with TT, null-move pruning, and LMR
 static Value alpha_beta_search(Position* pos, Depth depth, Value alpha, Value beta, int ply, UndoInfo* undo_stack, int* undo_stack_ptr) {
     if (depth <= 0) {
-        return evaluate_enhanced(pos);
+        return evaluate(pos);
     }
     
     bool in_check = is_check(pos, pos->sideToMove);
     
-    // Transposition table probe
+    Value mated_score = -30000 + ply;
+    Value mating_score = 30000 - (ply + 1);
+    if (mated_score >= beta) return beta;
+    if (mating_score <= alpha) return alpha;
+    
     TTEntry* tt_entry = tt_probe(pos->key);
+    Move tt_move = MOVE_NONE;
+    
     if (tt_entry->key == pos->key && tt_entry->depth >= depth) {
+        tt_move = tt_entry->best_move;
         if (tt_entry->flag == TT_EXACT) return tt_entry->value;
         if (tt_entry->flag == TT_LOWER && tt_entry->value >= beta) return tt_entry->value;
         if (tt_entry->flag == TT_UPPER && tt_entry->value <= alpha) return tt_entry->value;
     }
     
-    // Null move pruning (if not in check and depth >= 3)
-    if (!in_check && depth >= 3 && pos->materialScore + pos->psqtScore > -500) {
+    Value static_eval = evaluate(pos);
+    
+    if (!in_check && depth < 3 && static_eval + 600 <= alpha) {
+        return quiesce(pos, alpha, beta, undo_stack, undo_stack_ptr);
+    }
+    
+    // Futility pruning
+    bool improving = (ply >= 2 && static_eval > (undo_stack[*undo_stack_ptr - 2]).materialScore);
+    if (!in_check && depth < 7) {
+        Value futility_margin = (175 - 50 * improving) * depth;
+        if (static_eval - futility_margin >= beta && static_eval < 29000) {
+            return static_eval;
+        }
+    }
+    
+    // Null move pruning
+    if (!in_check && depth >= 2 && static_eval >= beta && pos->materialScore + pos->psqtScore > -500) {
+        int reduction = (823 + 67 * depth) / 256;
+        int eval_bonus = (static_eval - beta) / 200;
+        if (eval_bonus > 3) eval_bonus = 3;
+        reduction += eval_bonus;
+        if (reduction < 1) reduction = 1;
+        
         do_move(pos, MOVE_NULL, undo_stack, undo_stack_ptr);
-        Value null_score = -alpha_beta_search(pos, depth - 3, -beta, -beta + 1, ply + 1, undo_stack, undo_stack_ptr);
+        Value null_score = -alpha_beta_search(pos, depth - reduction, -beta, -beta + 1, ply + 1, undo_stack, undo_stack_ptr);
         undo_move(pos, MOVE_NULL, undo_stack, undo_stack_ptr);
         
         if (null_score >= beta) {
-            return beta;  // Null move cutoff
+            if (null_score >= 29000) null_score = beta;
+            return null_score;
         }
     }
     
@@ -1449,19 +1614,14 @@ static Value alpha_beta_search(Position* pos, Depth depth, Value alpha, Value be
     generate_legal(pos, &ml, undo_stack, undo_stack_ptr);
     
     if (ml.count == 0) {
-        return in_check ? -30000 + ply : 0;  // Checkmate or stalemate
+        return in_check ? -30000 + ply : 0;
     }
-    
-    // Enhanced move ordering: TT move > Killers > MVV-LVA
-    Move tt_move = (tt_entry->key == pos->key) ? tt_entry->best_move : MOVE_NONE;
     
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i].move;
         int score = mvv_lva_score(m, pos);
         
-        // Boost TT move
         if (m == tt_move) score += 10000;
-        // Boost killer moves
         else if (ply < 64 && (m == killer_moves[ply][0] || m == killer_moves[ply][1])) score += 5000;
         
         ml.moves[i].value = score;
@@ -1482,20 +1642,52 @@ static Value alpha_beta_search(Position* pos, Depth depth, Value alpha, Value be
     Move best_move = ml.moves[0].move;
     uint8_t tt_flag = TT_UPPER;
     
+    // Move count pruning thresholds
+    // See https://www.chessprogramming.org/Futility_Pruning
+    static const int futility_move_counts[2][16] = {
+        {3, 5, 7, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45},  // Not improving
+        {5, 8, 12, 16, 21, 26, 31, 36, 41, 46, 51, 56, 61, 66, 71, 76}  // Improving
+    };
+    
+    int move_count_limit = (depth < 16) ? futility_move_counts[improving][depth] : 999;
+    
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i].move;
+        bool is_capture = piece_on(pos, to_sq(m)) != NO_PIECE;
+        bool is_promotion = type_of_m(m) == PROMOTION;
         
-        // Late Move Reductions (LMR): reduce depth for likely-bad moves
-        int new_depth = depth - 1;
-        if (i >= 4 && depth >= 3 && !in_check && ml.moves[i].value < 1000) {
-            new_depth = depth - 2;  // Search at reduced depth
+        if (!in_check && i >= move_count_limit && !is_capture && !is_promotion && depth < 16) {
+            continue;
+        }
+        
+        if (!in_check && !is_capture && !is_promotion && depth < 7 && i > 0) {
+            Value futility_value = static_eval + (175 - 50 * improving) * depth;
+            if (futility_value + 256 <= alpha) {
+                continue;
+            }
+        }
+        
+        int reduction = 0;
+        if (depth >= 3 && i >= 3 && (!is_capture || i >= move_count_limit)) {
+            reduction = (int)(log((double)depth) * log((double)(i + 1)) / 1.95);
+            if (reduction < 1) reduction = 1;
+            
+            if (!improving) reduction++;
+            if (is_capture) reduction--;
+            if (reduction < 0) reduction = 0;
+            if (reduction > depth - 1) reduction = depth - 1;
         }
         
         do_move(pos, m, undo_stack, undo_stack_ptr);
-        Value score = -alpha_beta_search(pos, new_depth, -beta, -alpha, ply + 1, undo_stack, undo_stack_ptr);
         
-        // Re-search at full depth if LMR fails high
-        if (new_depth < depth - 1 && score > alpha) {
+        Value score;
+        if (reduction > 0) {
+            score = -alpha_beta_search(pos, depth - 1 - reduction, -beta, -alpha, ply + 1, undo_stack, undo_stack_ptr);
+            
+            if (score > alpha) {
+                score = -alpha_beta_search(pos, depth - 1, -beta, -alpha, ply + 1, undo_stack, undo_stack_ptr);
+            }
+        } else {
             score = -alpha_beta_search(pos, depth - 1, -beta, -alpha, ply + 1, undo_stack, undo_stack_ptr);
         }
         
@@ -1510,19 +1702,17 @@ static Value alpha_beta_search(Position* pos, Depth depth, Value alpha, Value be
                 tt_flag = TT_EXACT;
                 
                 if (alpha >= beta) {
-                    // Beta cutoff - store killer move
                     if (ply < 64 && piece_on(pos, to_sq(m)) == NO_PIECE) {
                         store_killer(m, ply);
                     }
-                    tt_store(pos->key, m, beta, depth, TT_LOWER);
+                    tt_store(pos->key, m, beta, depth, TT_LOWER, static_eval);
                     return beta;
                 }
             }
         }
     }
     
-    // Store in TT
-    tt_store(pos->key, best_move, best_score, depth, tt_flag);
+    tt_store(pos->key, best_move, best_score, depth, tt_flag, static_eval);
     return best_score;
 }
 
@@ -1573,7 +1763,6 @@ static Move search_random(Position* pos, UndoInfo* undo_stack, int* undo_stack_p
 }
 
 static Move search_minimax(Position* pos, Depth depth, UndoInfo* undo_stack, int* undo_stack_ptr) {
-    // Initialize TT on first use
     if (!tt_initialized) {
         tt_clear();
     }
@@ -1588,19 +1777,16 @@ static Move search_minimax(Position* pos, Depth depth, UndoInfo* undo_stack, int
     Value alpha = -32000;
     Value beta = 32000;
     
-    // Try TT move first if available
     TTEntry* tt_entry = tt_probe(pos->key);
     Move tt_move = (tt_entry->key == pos->key) ? tt_entry->best_move : MOVE_NONE;
     
-    // Enhanced move ordering
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i].move;
         int score = mvv_lva_score(m, pos);
-        if (m == tt_move) score += 10000;  // TT move first
+        if (m == tt_move) score += 10000;
         ml.moves[i].value = score;
     }
     
-    // Sort
     for (int i = 0; i < ml.count - 1; i++) {
         for (int j = i + 1; j < ml.count; j++) {
             if (ml.moves[j].value > ml.moves[i].value) {
@@ -1611,7 +1797,6 @@ static Move search_minimax(Position* pos, Depth depth, UndoInfo* undo_stack, int
         }
     }
     
-    // Evaluate all root moves
     int best_count = 0;
     ExtMove best_moves[256];
     
@@ -1629,12 +1814,11 @@ static Move search_minimax(Position* pos, Depth depth, UndoInfo* undo_stack, int
             best_moves[0] = ml.moves[i];
             if (score > alpha) alpha = score;
         } else if (score == best_score && best_count < 256) {
-            // Track all equally good moves
             best_moves[best_count++] = ml.moves[i];
         }
     }
     
-    // Add randomness: pick randomly among moves within 50cp of best (wider window)
+    // Randomness for training
     int candidate_count = 0;
     ExtMove candidates[256];
     for (int i = 0; i < ml.count; i++) {
@@ -1643,7 +1827,6 @@ static Move search_minimax(Position* pos, Depth depth, UndoInfo* undo_stack, int
         }
     }
     
-    // Pick randomly among best moves
     if (candidate_count > 0) {
         int idx = rand() % candidate_count;
         return candidates[idx].move;
@@ -1652,7 +1835,8 @@ static Move search_minimax(Position* pos, Depth depth, UndoInfo* undo_stack, int
     return best_moves[0].move;
 }
 
-static Move search_opponent_move(Position* pos, Depth depth, UndoInfo* undo_stack, int* undo_stack_ptr) {
+static Move search_opponent_move(Chess* env, Position* pos, Depth depth, UndoInfo* undo_stack, int* undo_stack_ptr) {
+    (void)env;
     if (depth < 0) return search_random(pos, undo_stack, undo_stack_ptr);
     if (depth == 0) return search_greedy_pseudo_legal(pos, undo_stack, undo_stack_ptr);
     return search_minimax(pos, depth, undo_stack, undo_stack_ptr);
@@ -1707,29 +1891,54 @@ void generate_legal(Position* pos, MoveList* ml, UndoInfo* undo_stack, int* undo
 }
 
 
-static inline int get_pst_value(Piece pc, Square sq) {
-    int pt = type_of_p(pc);
-    ChessColor c = color_of(pc);
-    Square s = (c == CHESS_WHITE) ? sq : (sq ^ 56);
-    
-    switch (pt) {
-        case PAWN: return PawnPST[s];
-        case KNIGHT: return KnightPST[s];
-        case BISHOP: return BishopPST[s];
-        case ROOK: return RookPST[s];
-        case QUEEN: return QueenPST[s];
-        case KING: return KingPST[s];
-        default: return 0;
-    }
-}
-
 static inline int get_material_value(Piece pc) {
     static const int piece_value_cp[7] = {0, 100, 320, 330, 500, 900, 0};
     return piece_value_cp[type_of_p(pc)];
 }
 
+static inline int get_pst_value_phase(Piece pc, Square sq, int phase) {
+    int pt = type_of_p(pc);
+    ChessColor c = color_of(pc);
+    Square s = (c == CHESS_WHITE) ? sq : (sq ^ 56);
+    
+    int mg, eg;
+    switch (pt) {
+        case PAWN:
+            mg = PawnPST_MG[s];
+            eg = PawnPST_EG[s];
+            break;
+        case KNIGHT:
+            mg = KnightPST_MG[s];
+            eg = KnightPST_EG[s];
+            break;
+        case BISHOP:
+            mg = BishopPST_MG[s];
+            eg = BishopPST_EG[s];
+            break;
+        case ROOK:
+            mg = RookPST_MG[s];
+            eg = RookPST_EG[s];
+            break;
+        case QUEEN:
+            mg = QueenPST_MG[s];
+            eg = QueenPST_EG[s];
+            break;
+        case KING:
+            mg = KingPST_MG[s];
+            eg = KingPST_EG[s];
+            break;
+        default:
+            return 0;
+    }
+    
+    return (mg * phase + eg * (24 - phase)) / 24;
+}
+
+static inline int get_pst_value(Piece pc, Square sq) {
+    return get_pst_value_phase(pc, sq, 12);
+}
+
 void do_move(Position* pos, Move m, UndoInfo* undo_stack, int* undo_stack_ptr) {
-    // Null move (for null move pruning)
     if (m == MOVE_NULL) {
         undo_stack[*undo_stack_ptr].captured = NO_PIECE;
         undo_stack[*undo_stack_ptr].castlingRights = pos->castlingRights;
@@ -1921,7 +2130,6 @@ void undo_move(Position* pos, Move m, UndoInfo* undo_stack, int* undo_stack_ptr)
     (*undo_stack_ptr)--;
     UndoInfo* undo = &undo_stack[*undo_stack_ptr];
     
-    // Undo null move
     if (m == MOVE_NULL) {
         pos->castlingRights = undo->castlingRights;
         pos->epSquare = undo->epSquare;
@@ -2085,49 +2293,101 @@ int game_result_with_legal_count(Position* pos, int legal_count, UndoInfo* undo_
 
 
 Value evaluate(Position* pos) {
-    return evaluate_enhanced(pos);
+    TTEntry* tte = tt_probe(pos->key);
+    if (tte->key == pos->key && tte->static_eval != 0) {
+        return tte->static_eval;
+    }
+    
+    Value eval = evaluate_enhanced(pos);
+    
+    tte->static_eval = eval;
+    if (tte->key != pos->key) {
+        tte->key = pos->key;
+    }
+    
+    return eval;
 }
 
+static void generate_pseudo_legal_captures(Position* pos, MoveList* ml) {
+    ml->count = 0;
+    ChessColor us = pos->sideToMove;
+    ChessColor them = !us;
+    
+    Bitboard pawns = pieces_cp(pos, us, PAWN);
+    while (pawns) {
+        Square from = pop_lsb(&pawns);
+        Bitboard attacks = pawn_attacks_bb(us, from) & pieces_c(pos, them);
+        while (attacks) {
+            Square to = pop_lsb(&attacks);
+            int to_rank = rank_of(to);
+            if ((us == CHESS_WHITE && to_rank == RANK_8) || (us == CHESS_BLACK && to_rank == RANK_1)) {
+                add_move(ml, make_promotion(from, to, QUEEN));
+                add_move(ml, make_promotion(from, to, KNIGHT));
+            } else {
+                add_move(ml, make_move(from, to));
+            }
+        }
+        
+        if (pos->epSquare != SQ_NONE && (pawn_attacks_bb(us, from) & sq_bb(pos->epSquare))) {
+            add_move(ml, make_enpassant(from, pos->epSquare));
+        }
+    }
+    
+    Bitboard targets = pieces_c(pos, them);
+    
+    Bitboard knights = pieces_cp(pos, us, KNIGHT);
+    while (knights) {
+        Square from = pop_lsb(&knights);
+        Bitboard attacks = knight_attacks_bb(from) & targets;
+        while (attacks) add_move(ml, make_move(from, pop_lsb(&attacks)));
+    }
+    
+    Bitboard bishops = pieces_cp(pos, us, BISHOP);
+    while (bishops) {
+        Square from = pop_lsb(&bishops);
+        Bitboard attacks = bishop_attacks_bb(from, pieces(pos)) & targets;
+        while (attacks) add_move(ml, make_move(from, pop_lsb(&attacks)));
+    }
+    
+    Bitboard rooks = pieces_cp(pos, us, ROOK);
+    while (rooks) {
+        Square from = pop_lsb(&rooks);
+        Bitboard attacks = rook_attacks_bb(from, pieces(pos)) & targets;
+        while (attacks) add_move(ml, make_move(from, pop_lsb(&attacks)));
+    }
+    
+    Bitboard queens = pieces_cp(pos, us, QUEEN);
+    while (queens) {
+        Square from = pop_lsb(&queens);
+        Bitboard attacks = queen_attacks_bb(from, pieces(pos)) & targets;
+        while (attacks) add_move(ml, make_move(from, pop_lsb(&attacks)));
+    }
+    
+    Bitboard king = pieces_cp(pos, us, KING);
+    if (king) {
+        Square from = lsb(king);
+        Bitboard attacks = king_attacks_bb(from) & targets;
+        while (attacks) add_move(ml, make_move(from, pop_lsb(&attacks)));
+    }
+}
 
 static Value quiesce(Position* pos, Value alpha, Value beta, UndoInfo* undo_stack, int* undo_stack_ptr) {
-    Value stand_pat = evaluate_enhanced(pos);
+    Value stand_pat = evaluate(pos);
     
     if (stand_pat >= beta)
         return stand_pat;
     
-    if (alpha < stand_pat)
-        alpha = stand_pat;
+    // Delta pruning (can't improve beyond queen value)
+    if (stand_pat < alpha - 900)
+        return alpha;
+    
+    Value best_value = stand_pat;
+    if (best_value > alpha)
+        alpha = best_value;
     
     MoveList ml;
-    ml.count = 0;
-    ChessColor us = pos->sideToMove;
+    generate_pseudo_legal_captures(pos, &ml);
     
-    generate_pawn_moves(pos, &ml, us);
-    generate_piece_moves(pos, &ml, KNIGHT, us);
-    generate_piece_moves(pos, &ml, BISHOP, us);
-    generate_piece_moves(pos, &ml, ROOK, us);
-    generate_piece_moves(pos, &ml, QUEEN, us);
-    generate_piece_moves(pos, &ml, KING, us);
-    
-    UndoInfo local_undo[256];
-    int local_ptr = 0;
-    
-    int capture_count = 0;
-    for (int i = 0; i < ml.count; i++) {
-        Move m = ml.moves[i].move;
-        if (piece_on(pos, to_sq(m)) != NO_PIECE) {
-            do_move(pos, m, local_undo, &local_ptr);
-            bool legal = !is_check(pos, us);
-            undo_move(pos, m, local_undo, &local_ptr);
-            
-            if (legal) {
-                ml.moves[capture_count++] = ml.moves[i];
-            }
-        }
-    }
-    ml.count = capture_count;
-    
-    // Order captures with MVV-LVA
     for (int i = 0; i < ml.count; i++) {
         ml.moves[i].value = mvv_lva_score(ml.moves[i].move, pos);
     }
@@ -2141,19 +2401,41 @@ static Value quiesce(Position* pos, Value alpha, Value beta, UndoInfo* undo_stac
         }
     }
     
+    ChessColor us = pos->sideToMove;
+    
+    // Search captures
     for (int i = 0; i < ml.count; i++) {
         Move m = ml.moves[i].move;
-        do_move(pos, m, local_undo, &local_ptr);
-        Value score = -quiesce(pos, -beta, -alpha, local_undo, &local_ptr);
-        undo_move(pos, m, local_undo, &local_ptr);
+        Piece captured = piece_on(pos, to_sq(m));
+        if (captured != NO_PIECE) {
+            int capture_value = get_material_value(captured);
+            if (stand_pat + capture_value + 200 < alpha) {
+                continue;
+            }
+        }
+        
+        do_move(pos, m, undo_stack, undo_stack_ptr);
+        bool legal = !is_check(pos, us);
+        
+        Value score = VALUE_ZERO;
+        if (legal) {
+            score = -evaluate(pos);
+        }
+        
+        undo_move(pos, m, undo_stack, undo_stack_ptr);
+        
+        if (!legal) continue;
         
         if (score >= beta)
             return beta;
-        if (score > alpha)
-            alpha = score;
+        if (score > best_value) {
+            best_value = score;
+            if (score > alpha)
+                alpha = score;
+        }
     }
     
-    return alpha;
+    return best_value;
 }
 
 static Value alpha_beta(Position* pos, Depth depth, Value alpha, Value beta, UndoInfo* undo_stack, int* undo_stack_ptr) {
@@ -2169,12 +2451,10 @@ static Value alpha_beta(Position* pos, Depth depth, Value alpha, Value beta, Und
         return VALUE_DRAW;
     }
     
-    // MVV-LVA move ordering
     for (int i = 0; i < ml.count; i++) {
         ml.moves[i].value = mvv_lva_score(ml.moves[i].move, pos);
     }
     
-    // Sort moves by score
     for (int i = 0; i < ml.count - 1; i++) {
         for (int j = i + 1; j < ml.count; j++) {
             if (ml.moves[j].value > ml.moves[i].value) {
@@ -2264,6 +2544,36 @@ void populate_observations(Chess* env) {
         ep_onehot[64] = 1;
     }
     
+    uint8_t* valid_pieces = obs + O_VALID_PIECES;
+    uint8_t* valid_dests = obs + O_VALID_DESTS;
+    
+    if (env->legal_moves_side != pos->sideToMove) {
+        generate_legal(pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+        env->legal_moves_side = pos->sideToMove;
+    }
+    
+    if (env->pick_phase == 0) {
+        for (int i = 0; i < env->legal_moves.count; i++) {
+            Square from = from_sq(env->legal_moves.moves[i].move);
+            valid_pieces[from] = 1;
+        }
+        
+    } else {
+        for (int i = 0; i < env->valid_destinations.count; i++) {
+            Square to = to_sq(env->valid_destinations.moves[i].move);
+            valid_dests[to] = 1;
+        }
+        
+        if (env->valid_destinations.count == 0) {
+            env->pick_phase = 0;
+            env->selected_square = SQ_NONE;
+            for (int i = 0; i < env->legal_moves.count; i++) {
+                Square from = from_sq(env->legal_moves.moves[i].move);
+                valid_pieces[from] = 1;
+            }
+        }
+    }
+    
     uint8_t* phase_onehot = obs + O_PICK_PHASE;
     phase_onehot[env->pick_phase] = 1;
     
@@ -2271,28 +2581,12 @@ void populate_observations(Chess* env) {
     if (env->pick_phase == 1 && env->selected_square != SQ_NONE) {
         selected_piece_plane[env->selected_square] = 1;
     }
-    
-    uint8_t* valid_pieces = obs + O_VALID_PIECES;
-    uint8_t* valid_dests = obs + O_VALID_DESTS;
-    
-    if (env->pick_phase == 0) {
-        for (int i = 0; i < env->legal_moves.count; i++) {
-            Square from = from_sq(env->legal_moves.moves[i].move);
-            valid_pieces[from] = 1;
-        }
-    } else {
-        for (int i = 0; i < env->valid_destinations.count; i++) {
-            Square to = to_sq(env->valid_destinations.moves[i].move);
-            valid_dests[to] = 1;
-        }
-    }
 }
 
 void generate_random_fen(char* fen_out) {
     char board[64];
     memset(board, '.', 64);
     
-    // Place kings (not adjacent)
     int wk_sq, bk_sq;
     do {
         wk_sq = rand() % 64;
@@ -2307,7 +2601,6 @@ void generate_random_fen(char* fen_out) {
     board[wk_sq] = 'K';
     board[bk_sq] = 'k';
     
-    // Add random pieces (up to 15 white, 15 black)
     const char* white_pieces = "QRRNNBBPP";
     const char* black_pieces = "qrrnnbbpp";
     int num_white = rand() % 16;
@@ -2335,7 +2628,6 @@ void generate_random_fen(char* fen_out) {
         board[sq] = piece;
     }
     
-    // Convert to FEN
     char* ptr = fen_out;
     for (int rank = 7; rank >= 0; rank--) {
         int empty = 0;
@@ -2373,8 +2665,6 @@ void c_reset(Chess* env) {
     env->selected_square = SQ_NONE;
     env->valid_destinations.count = 0;
     
-    // Keep scoreboard across games (don't reset ai_score/opponent_score/last_result)
-    
     if (strcmp(env->starting_fen, "random") == 0) {
         char random_fen[128];
         generate_random_fen(random_fen);
@@ -2384,6 +2674,7 @@ void c_reset(Chess* env) {
     }
     
     generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+    env->legal_moves_side = env->pos.sideToMove;
     populate_observations(env);
 }
 
@@ -2400,8 +2691,23 @@ void c_step(Chess* env) {
         return;
     }
     
+    if (env->reward_shaping_anneal_steps > 0) {
+        env->env_training_steps++;
+        float progress = (float)env->env_training_steps / env->reward_shaping_anneal_steps;
+        if (progress > 1.0f) progress = 1.0f;
+        
+        env->reward_shaping_weight = env->reward_shaping_weight_initial * (1.0f - progress) 
+                                    + env->reward_shaping_weight_final * progress;
+    }
+    
     env->rewards[0] = 0.0f;
     env->terminals[0] = 0;
+    
+    if (env->legal_moves.count == 0) {
+        env->terminals[0] = 1;
+        env->rewards[0] = is_check(&env->pos, env->pos.sideToMove) ? -1.0f : env->reward_draw;
+        return;
+    }
     
     int action = env->actions[0];
     if (action < 0) action = 0;
@@ -2476,9 +2782,13 @@ void c_step(Chess* env) {
         env->log.illegal_moves += 1.0f; 
     }
     
-    Move opp_move = search_opponent_move(&env->pos, env->opponent_depth, env->undo_stack, &env->undo_stack_ptr);
+    Move opp_move = search_opponent_move(env, &env->pos, env->opponent_depth, env->undo_stack, &env->undo_stack_ptr);
     
     if (opp_move == MOVE_NONE) {
+        env->pick_phase = 0;
+        env->selected_square = SQ_NONE;
+        env->valid_destinations.count = 0;
+        
         env->rewards[0] = is_check(&env->pos, env->pos.sideToMove) ? 1.0f : env->reward_draw;
         env->terminals[0] = 1;
         if (env->rewards[0] > 0.5f) {
@@ -2501,11 +2811,16 @@ void c_step(Chess* env) {
         }
         env->log.n += 1.0f;
         generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+        env->legal_moves_side = env->pos.sideToMove;
         populate_observations(env);
         return;
     }
     
     if (is_draw_with_history(&env->pos, env->undo_stack, env->undo_stack_ptr)) {
+        env->pick_phase = 0;
+        env->selected_square = SQ_NONE;
+        env->valid_destinations.count = 0;
+        
         env->rewards[0] = env->reward_draw;
         env->terminals[0] = 1;
         env->log.draws += 1.0f;
@@ -2522,11 +2837,16 @@ void c_step(Chess* env) {
         }
         env->log.n += 1.0f;
         generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+        env->legal_moves_side = env->pos.sideToMove;
         populate_observations(env);
         return;
     }
     
     if (env->chess_moves >= env->max_moves) {
+        env->pick_phase = 0;
+        env->selected_square = SQ_NONE;
+        env->valid_destinations.count = 0;
+        
         env->rewards[0] = env->reward_draw;
         env->terminals[0] = 1;
         env->log.timeouts += 1.0f;
@@ -2543,6 +2863,7 @@ void c_step(Chess* env) {
         }
         env->log.n += 1.0f;
         generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+        env->legal_moves_side = env->pos.sideToMove;
         populate_observations(env);
         return;
     }
@@ -2558,9 +2879,14 @@ void c_step(Chess* env) {
     }
     
     generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+    env->legal_moves_side = env->pos.sideToMove;
     env->game_result = game_result_with_legal_count(&env->pos, env->legal_moves.count, env->undo_stack, env->undo_stack_ptr);
     
     if (env->game_result) {
+        env->pick_phase = 0;
+        env->selected_square = SQ_NONE;
+        env->valid_destinations.count = 0;
+        
         if (env->game_result == 1) {
             env->rewards[0] = 1.0f;
             env->log.wins += 1.0f;
@@ -2602,6 +2928,8 @@ void c_step(Chess* env) {
         env->rewards[0] += env->reward_shaping_weight * normalized_delta;
     }
     
+    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+    env->legal_moves_side = env->pos.sideToMove;
     populate_observations(env);
 }
 
@@ -2617,7 +2945,6 @@ void c_render(Chess* env) {
         env->client = (Client*)calloc(1, sizeof(Client));
         env->client->cell_size = cell_size;
         
-        // Initialize scoreboard on first render
         env->ai_score = 0.0f;
         env->opponent_score = 0.0f;
         strcpy(env->last_result, "Game starting...");
@@ -2655,12 +2982,13 @@ void c_render(Chess* env) {
                 if (chosen != MOVE_NONE) {
                     do_move(&env->pos, chosen, env->undo_stack, &env->undo_stack_ptr);
                     env->tick++;
-                    Move opp = search_opponent_move(&env->pos, env->opponent_depth, env->undo_stack, &env->undo_stack_ptr);
+                    Move opp = search_opponent_move(env, &env->pos, env->opponent_depth, env->undo_stack, &env->undo_stack_ptr);
                     if (opp != MOVE_NONE) {
                         do_move(&env->pos, opp, env->undo_stack, &env->undo_stack_ptr);
                         env->tick++;
                     }
                     generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+                    env->legal_moves_side = env->pos.sideToMove;
                 }
                 selected_sq = -1;
             }
@@ -2702,10 +3030,10 @@ void c_render(Chess* env) {
     }
     
     const char* piece_chars[] = {
-        "",      // 0 = empty
-        "P", "N", "B", "R", "Q", "K",  // 1..6 white
-        "", "",                               // 7,8 unused
-        "p", "n", "b", "r", "q", "k"   // 9..14 black
+        "",
+        "P", "N", "B", "R", "Q", "K",
+        "", "",
+        "p", "n", "b", "r", "q", "k"
     };
     
     for (Square sq = SQ_A1; sq <= SQ_H8; sq++) {
@@ -2724,14 +3052,12 @@ void c_render(Chess* env) {
         }
     }
     
-    // Draw scoreboard at bottom
     const int scoreboard_y = board_size + 10;
     char score_text[128];
     snprintf(score_text, sizeof(score_text), "AI: %.1f  Opponent: %.1f", 
              env->ai_score, env->opponent_score);
     DrawText(score_text, 10, scoreboard_y, 20, WHITE);
     
-    // Draw last result
     if (env->last_result[0] != '\0') {
         Color result_color = GREEN;
         if (strstr(env->last_result, "Opponent")) result_color = RED;
@@ -2740,7 +3066,6 @@ void c_render(Chess* env) {
         DrawText(env->last_result, 10, scoreboard_y + 25, 18, result_color);
     }
     
-    // Draw current move count
     char move_text[64];
     snprintf(move_text, sizeof(move_text), "Move: %d", env->chess_moves);
     DrawText(move_text, board_size - 100, scoreboard_y, 18, LIGHTGRAY);
@@ -2761,7 +3086,6 @@ void c_close(Chess* env) {
         env->client = NULL;
     }
 #else
-    (void)env;  // Unused when rendering disabled
+    (void)env;
 #endif
 }
-
