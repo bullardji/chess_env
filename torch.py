@@ -25,7 +25,6 @@ class ChessCNN(nn.Module):
         self.hidden_size = hidden_size
         self.is_continuous = False
         
-        # Dirichlet noise params (like AlphaZero / Leela)
         self.noise_epsilon = noise_epsilon
         self.noise_alpha = noise_alpha
         
@@ -46,7 +45,6 @@ class ChessCNN(nn.Module):
         self.actor = layer_init(nn.Linear(hidden_size, 64), std=0.01)
         self.value_head = layer_init(nn.Linear(hidden_size, 1), std=1)
         
-        # Cache for action masking
         self.register_buffer('_cached_mask', None, persistent=False)
     
     def forward(self, observations, state=None):
@@ -92,11 +90,10 @@ class ChessCNN(nn.Module):
         
         board_input = torch.cat([board, side_plane, castle_planes, ep_plane, phase_plane, selected_piece], dim=1)
         
-        # Cache mask for action masking in decode_actions
         phase_onehot = obs[:, 851:853]
-        pick_phase = phase_onehot[:, 1]  # 1 if picking destination, 0 if picking piece
-        valid_pieces = obs[:, 917:981]  # Phase 0 mask
-        valid_dests = obs[:, 981:1045]  # Phase 1 mask
+        pick_phase = phase_onehot[:, 1]
+        valid_pieces = obs[:, 917:981]
+        valid_dests = obs[:, 981:1045]
         self._cached_mask = torch.where(pick_phase.unsqueeze(1) > 0.5, valid_dests, valid_pieces)
         
         hidden = self.network(board_input)
@@ -105,30 +102,17 @@ class ChessCNN(nn.Module):
     def decode_actions(self, hidden, state=None, add_noise=False):
         logits = self.actor(hidden)
         
-        # Apply cached mask if available (set in encode_observations)
         if self._cached_mask is not None:
             logits = logits.masked_fill(self._cached_mask == 0, -1e9)
         
-        # Add Dirichlet noise during training (like AlphaZero/Leela)
         if add_noise and self.training and self.noise_epsilon > 0:
-            # Get valid actions from mask
-            valid_mask = self._cached_mask if self._cached_mask is not None else torch.ones_like(logits)
-            num_valid = valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            probs = F.softmax(logits, dim=-1)
             
-            # Sample Dirichlet noise
-            # Use alpha scaled by number of valid moves for better distribution
-            alpha = torch.ones_like(logits) * self.noise_alpha
-            alpha = alpha.masked_fill(valid_mask == 0, 1e-10)  # Tiny value for invalid
-            
+            alpha = torch.ones_like(probs) * self.noise_alpha
             dirichlet = torch.distributions.Dirichlet(alpha)
             noise = dirichlet.sample()
             
-            # Mix: logits' = (1-ε)*P(logits) + ε*noise
-            # Convert logits to probs, mix with noise, convert back
-            probs = F.softmax(logits, dim=-1)
             mixed_probs = (1 - self.noise_epsilon) * probs + self.noise_epsilon * noise
-            
-            # Convert back to logits (log of mixed probs)
             logits = torch.log(mixed_probs.clamp(min=1e-10))
         
         value = self.value_head(hidden)
