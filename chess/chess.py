@@ -7,9 +7,15 @@ from pufferlib.ocean.chess import binding
 class Chess(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0,
                  max_moves=3000, opponent_depth=-1, reward_shaping_weight=0.05,
+                 reward_shaping_weight_initial=None, reward_shaping_weight_final=0.0,
+                 reward_shaping_anneal_steps=0.0,
                  reward_draw=-0.5, reward_invalid_piece=-0.1, reward_invalid_move=-0.1, 
                  reward_valid_piece=0.0, reward_valid_move=0.0, render_fps=30, human_play=0,
                  starting_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"):
+        # Auto-set initial weight if not provided (for backwards compatibility)
+        if reward_shaping_weight_initial is None:
+            reward_shaping_weight_initial = reward_shaping_weight
+        
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=255, shape=(1045,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.Discrete(64)
@@ -23,7 +29,11 @@ class Chess(pufferlib.PufferEnv):
             self.observations, self.actions, self.rewards,
             self.terminals, self.truncations, num_envs, seed,
             max_moves=max_moves, opponent_depth=opponent_depth,
-            reward_shaping_weight=reward_shaping_weight, reward_draw=reward_draw,
+            reward_shaping_weight=reward_shaping_weight,
+            reward_shaping_weight_initial=reward_shaping_weight_initial,
+            reward_shaping_weight_final=reward_shaping_weight_final,
+            reward_shaping_anneal_steps=reward_shaping_anneal_steps,
+            reward_draw=reward_draw,
             reward_invalid_piece=reward_invalid_piece, reward_invalid_move=reward_invalid_move,
             reward_valid_piece=reward_valid_piece, reward_valid_move=reward_valid_move,
             render_fps=render_fps, human_play=human_play, starting_fen=starting_fen)
